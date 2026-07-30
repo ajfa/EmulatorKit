@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <string.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -1082,6 +1083,7 @@ int main(int argc, char *argv[])
 	char *rompath = "max80.rom";
 	char *fdc_path[4] = { NULL, NULL, NULL, NULL };
 	char *disk_path = NULL;
+	char ddampath[PATH_MAX];
 
 	while ((opt = getopt(argc, argv, "8A:B:C:D:S:d:r:f")) != -1) {
 		switch (opt) {
@@ -1141,6 +1143,11 @@ int main(int argc, char *argv[])
 			printf("[Drive %c, %s.]\n", 'A' + i, d->name);
 			wd17xx_attach(fdc, i, fdc_path[i], d->sides, d->tracks, d->spt, d->secsize);
 			wd17xx_set_sector0(fdc, i, d->sector0);
+			/* TRSDOS derived systems mark the directory track with
+			   deleted data marks. A raw image cannot hold those, so
+			   pick them up from a sidecar file if one exists. */
+			snprintf(ddampath, sizeof(ddampath), "%s.ddam", fdc_path[i]);
+			wd17xx_attach_ddam(fdc, i, ddampath);
 			/* Double density; required for now TODO */
 			wd17xx_set_media_density(fdc, i, DEN_DD);
 		}
@@ -1240,6 +1247,9 @@ int main(int argc, char *argv[])
 				sio_timer(sio);
 			}
 			/* ~8295 T states */
+			/* Keep the media turning at this granularity so a
+			   guest polling the index bit sees it pulse */
+			wd17xx_rotate(fdc, 1660);
 			if (ui_event())
 				emulator_done = 1;
 			/* Do a small block of I/O and delays */

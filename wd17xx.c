@@ -22,6 +22,12 @@ struct wd17xx {
 	unsigned int side1[4];	/* Base track number for second side. Usually 0
 				   but some systems do strange stuff */
 	unsigned int diskden[4];
+	uint8_t *ddam[4];	/* Per sector deleted data address marks, or NULL */
+	char *ddampath[4];	/* Sidecar file the marks came from */
+	unsigned int nsec[4];	/* Sectors in the ddam map */
+	unsigned int ddamdirty[4];
+	unsigned int rotation;	/* Position within a revolution, in us */
+	unsigned int wrdeleted;	/* Write this sector with a deleted mark */
 	unsigned int drive;
 	uint8_t buf[2048];
 	unsigned int pos;
@@ -58,9 +64,16 @@ struct wd17xx {
 #define DRQ 		0x02	/* not type 1 */
 #define BUSY		0x01	/* all */
 
+#define RECTYPE		0x20	/* type 2 read: 1 = deleted data mark */
+
 #define NO_DRIVE	0xFF
 
-static void wd17xx_diskseek(struct wd17xx *fdc)
+#define REV_US		200000	/* One revolution at 300rpm */
+#define INDEX_US	2000	/* Index hole width */
+
+/* Linear sector number of the currently addressed sector. The image layout
+   is cylinder major, then head, then sector in ascending ID order. */
+static off_t wd17xx_lba(struct wd17xx *fdc)
 {
 	off_t pos;
 	unsigned track = fdc->track;
@@ -73,6 +86,45 @@ static void wd17xx_diskseek(struct wd17xx *fdc)
 	pos += fdc->sector - fdc->sector0[fdc->drive];
 	if (fdc->sides[fdc->drive] == 2 && fdc->side)
 		pos += fdc->spt[fdc->drive];
+	return pos;
+}
+
+static void wd17xx_flush_ddam(struct wd17xx *fdc, int dev);
+
+/* Is the addressed sector recorded with a deleted data address mark ? */
+static int wd17xx_is_deleted(struct wd17xx *fdc)
+{
+	off_t lba = wd17xx_lba(fdc);
+	if (fdc->ddam[fdc->drive] == NULL)
+		return 0;
+	if (lba < 0 || lba >= fdc->nsec[fdc->drive])
+		return 0;
+	return fdc->ddam[fdc->drive][lba];
+}
+
+/* Record the address mark used for the sector we just wrote */
+static void wd17xx_set_deleted(struct wd17xx *fdc, unsigned deleted)
+{
+	off_t lba = wd17xx_lba(fdc);
+	unsigned drive = fdc->drive;
+	if (fdc->ddam[drive] == NULL || lba < 0 || lba >= fdc->nsec[drive])
+		return;
+	if (fdc->ddam[drive][lba] == deleted)
+		return;
+	fdc->ddam[drive][lba] = deleted;
+	fdc->ddamdirty[drive] = 1;
+	/* Persist right away: the emulator has no orderly shutdown path */
+	wd17xx_flush_ddam(fdc, drive);
+}
+
+static void wd17xx_diskseek(struct wd17xx *fdc)
+{
+	off_t pos = wd17xx_lba(fdc);
+	unsigned track = fdc->track;
+
+	if (fdc->side)
+		track -= fdc->side1[fdc->drive];
+
 	pos *= fdc->secsize[fdc->drive];
 	if (lseek(fdc->fd[fdc->drive], pos, SEEK_SET) < 0) {
 		perror("lseek");
@@ -134,6 +186,7 @@ void wd17xx_write_data(struct wd17xx *fdc, uint8_t v)
 			perror("wd17xx: write: ");
 			fprintf(stderr, "wd17xx: I/O error.\n");
 		}
+		wd17xx_set_deleted(fdc, fdc->wrdeleted);
 		fdc->status &= ~(BUSY | DRQ);
 		fdc->wr = 0;
 		fdc->intrq = 1;
@@ -187,6 +240,19 @@ void wd17xx_motor(struct wd17xx *fdc, unsigned on)
 		fdc->motor = fdc->motor_timeout;	/* 10,000 ms */
 		fdc->spinup = 1000;
 	}
+}
+
+/* Advance the rotational position of the media. A driver that calls this
+   gets a pulsing index bit; one that never calls it leaves the position at
+   zero and sees the index permanently asserted, which is what the code did
+   before this existed. */
+void wd17xx_rotate(struct wd17xx *fdc, unsigned us)
+{
+	if (fdc->motor == 0)
+		return;
+	fdc->rotation += us;
+	while (fdc->rotation >= REV_US)
+		fdc->rotation -= REV_US;
 }
 
 void wd17xx_set_motor_time(struct wd17xx *fdc, unsigned n)
@@ -412,10 +478,15 @@ void wd17xx_command(struct wd17xx *fdc, uint8_t v)
 		fdc->rdsize = size;
 		fdc->status |= DRQ;
 		fdc->busy = 0;
-#if 0
-		if (track == 20)
-			fdc->status |= 0x20;	/* HACK for DDAM */
-#endif
+		/* Report the address mark type. TRSDOS style systems mark the
+		   directory track with deleted data marks and use this to find
+		   it, so we must report it accurately. */
+		if (wd17xx_is_deleted(fdc)) {
+			fdc->status |= RECTYPE;
+			if (fdc->trace)
+				fprintf(stderr, "fdc%d: sector %d,%d,%d has a deleted data mark.\n",
+					fdc->drive, fdc->side, track, fdc->sector);
+		}
 		wd17xx_check_density(fdc);
 		wd17xx_motor(fdc, motor);
 		break;
@@ -433,6 +504,8 @@ void wd17xx_command(struct wd17xx *fdc, uint8_t v)
 		fdc->status |= DRQ;
 		fdc->busy = 0;
 		fdc->wr = 1;
+		/* Bit 0 selects a deleted data address mark for this write */
+		fdc->wrdeleted = v & 0x01;
 		wd17xx_motor(fdc, motor);
 		wd17xx_side_control(fdc, v);
 		wd17xx_check_density(fdc);
@@ -506,8 +579,7 @@ void wd17xx_command(struct wd17xx *fdc, uint8_t v)
 
 uint8_t wd17xx_status(struct wd17xx *fdc)
 {
-	if (fdc->trace)
-		fprintf(stderr, "fdc%d: status %x.\n", fdc->drive, fdc->status);
+	uint8_t r;
 	fdc->intrq = 0;
 	if (fdc->busy) {
 		fdc->busy--;
@@ -519,9 +591,22 @@ uint8_t wd17xx_status(struct wd17xx *fdc)
 	/* On the 1793 0x80 is high when the drive is not ready
 	   On the 1772 it means motor on so is inverted */
 	if (fdc->type == 1772)
-		return fdc->status | (fdc->motor ? 0x80 : 0x00);
+		r = fdc->status | (fdc->motor ? 0x80 : 0x00);
 	else	/* Treat not ready as motor off - really it lags TODO */
-		return fdc->status | (fdc->motor ? 0x00 : 0x80);
+		r = fdc->status | (fdc->motor ? 0x00 : 0x80);
+	/* The index bit of a type 1 status follows the index hole going past
+	   the sensor, so a guest polling it has to see the pulse both arrive
+	   and pass. Holding it permanently asserted hangs drivers that wait
+	   for it to clear; holding it low hangs those that wait for it. */
+	if (fdc->lastcmd < 0x80) {
+		r &= ~INDEX;
+		if (fdc->rotation < INDEX_US)
+			r |= INDEX;
+	}
+	/* Report what the guest actually sees, motor bit included */
+	if (fdc->trace)
+		fprintf(stderr, "fdc%d: status %x.\n", fdc->drive, r);
+	return r;
 }
 
 uint8_t wd17xx_status_noclear(struct wd17xx *fdc)
@@ -555,8 +640,93 @@ struct wd17xx *wd17xx_create(unsigned type)
 	return fdc;
 }
 
+/* Write the deleted data mark map back out if the guest changed it */
+static void wd17xx_flush_ddam(struct wd17xx *fdc, int dev)
+{
+	FILE *f;
+	unsigned int lba;
+	unsigned int spt, sides;
+
+	if (!fdc->ddamdirty[dev] || fdc->ddampath[dev] == NULL)
+		return;
+	f = fopen(fdc->ddampath[dev], "w");
+	if (f == NULL) {
+		perror(fdc->ddampath[dev]);
+		return;
+	}
+	spt = fdc->spt[dev];
+	sides = fdc->sides[dev];
+	for (lba = 0; lba < fdc->nsec[dev]; lba++) {
+		if (!fdc->ddam[dev][lba])
+			continue;
+		fprintf(f, "%u %u %u\n",
+			lba / (spt * sides),
+			(lba / spt) % sides,
+			lba % spt + fdc->sector0[dev]);
+	}
+	fclose(f);
+	fdc->ddamdirty[dev] = 0;
+}
+
+/* Attach a sidecar file of "cylinder head sector" lines listing the sectors
+   recorded with deleted data address marks. Raw sector images cannot carry
+   this, but TRSDOS derived systems need it to locate the directory. */
+int wd17xx_attach_ddam(struct wd17xx *fdc, int dev, const char *path)
+{
+	FILE *f;
+	char buf[128];
+	unsigned int c, h, s;
+	unsigned int n = 0;
+	off_t lba;
+
+	fdc->nsec[dev] = fdc->tracks[dev] * fdc->sides[dev] * fdc->spt[dev];
+	free(fdc->ddam[dev]);
+	fdc->ddam[dev] = calloc(1, fdc->nsec[dev]);
+	if (fdc->ddam[dev] == NULL) {
+		fprintf(stderr, "wd17xx: out of memory.\n");
+		exit(1);
+	}
+	free(fdc->ddampath[dev]);
+	fdc->ddampath[dev] = strdup(path);
+	fdc->ddamdirty[dev] = 0;
+
+	f = fopen(path, "r");
+	if (f == NULL) {
+		/* No marks yet is fine: the guest may create some */
+		if (fdc->trace)
+			fprintf(stderr, "fdc%d: no ddam map at %s.\n", dev, path);
+		return 0;
+	}
+	while (fgets(buf, sizeof(buf), f)) {
+		if (buf[0] == '#' || buf[0] == '\n')
+			continue;
+		if (sscanf(buf, "%u %u %u", &c, &h, &s) != 3)
+			continue;
+		if (s < fdc->sector0[dev])
+			continue;
+		lba = (c * fdc->sides[dev] + h) * fdc->spt[dev]
+			+ s - fdc->sector0[dev];
+		if (lba < 0 || lba >= fdc->nsec[dev]) {
+			fprintf(stderr, "wd17xx: ddam entry %u %u %u out of range.\n",
+				c, h, s);
+			continue;
+		}
+		fdc->ddam[dev][lba] = 1;
+		n++;
+	}
+	fclose(f);
+	if (fdc->trace)
+		fprintf(stderr, "fdc%d: %u deleted data marks from %s.\n", dev, n, path);
+	return n;
+}
+
 void wd17xx_detach(struct wd17xx *fdc, int dev)
 {
+	wd17xx_flush_ddam(fdc, dev);
+	free(fdc->ddam[dev]);
+	fdc->ddam[dev] = NULL;
+	free(fdc->ddampath[dev]);
+	fdc->ddampath[dev] = NULL;
 	if (fdc->fd[dev] != -1)
 		close(fdc->fd[dev]);
 	fdc->fd[dev] = -1;
