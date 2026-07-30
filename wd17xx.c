@@ -312,7 +312,6 @@ void wd17xx_command(struct wd17xx *fdc, uint8_t v)
 	}
 
 	fdc->lastcmd = v;
-	fdc->busy = 0;
 
 	track = fdc->track;
 	if (fdc->side)
@@ -326,6 +325,7 @@ void wd17xx_command(struct wd17xx *fdc, uint8_t v)
 		fdc->rd = 0;
 		fdc->wr = 0;
 		fdc->pos = 0;
+		fdc->busy = 0;
 		if (fdc->status & BUSY)
 			fdc->status &= ~BUSY;
 		else {
@@ -338,6 +338,11 @@ void wd17xx_command(struct wd17xx *fdc, uint8_t v)
 		wd17xx_motor(fdc, 1);
 		return;
 	}
+	/* A command issued while the controller is busy is ignored and the one
+	   in progress carries on. Do not disturb the busy countdown here: the
+	   BUSY bit is only ever cleared as that countdown reaches zero, so
+	   zeroing it for a command we are about to drop wedges the status
+	   register with BUSY set for good. */
 	if (fdc->status & BUSY)
 		return;
 

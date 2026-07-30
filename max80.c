@@ -550,9 +550,15 @@ static uint8_t mb_read(uint16_t addr, unsigned debug)
 	switch (addr & ~3) {
 	case 0x07D0:		/* BAUDA */
 	case 0x07D4:		/* BAUDB */
-	case 0x07D8:		/* MLATCH */
 	case 0x07DC:		/* VLATCH */
 		return read_banka(paddr);
+	case 0x07D8:		/* MLATCH */
+		/* The drive latch reads back. Both the boot ROM ("res 7,(iy+0)
+		   REFRESH MINI MOTORS") and the CP/M BIOS wait loop
+		   read-modify-write it, so handing them the RAM underneath
+		   makes them store rubbish into the drive select and the
+		   controller never finishes its command. */
+		return mlatch;
 	case 0x07E0:		/* SYSCLR and SYSFLG CRTREG/CRTBYT */
 		r = sysstat;
 		r &= ~0x20;
