@@ -984,12 +984,16 @@ static SDL_Keycode keyboard[] = {
 	SDLK_LSHIFT, SDLK_F1, SDLK_F2, SDLK_F3, SDLK_F4, SDLK_ESCAPE, 0, SDLK_LCTRL
 };
 
-/* Most PC layouts don't have a colon key so use # */
+/* Most PC layouts don't have a colon key so use # or ' */
 static void keytranslate(SDL_Event *ev)
 {
 	SDL_Keycode c = ev->key.keysym.sym;
 	switch (c) {
 	case SDLK_HASH:
+	/* On a US layout # is a shifted key, so SDL never reports SDLK_HASH
+	   there. Offer the unshifted quote key as well or there is no way to
+	   type the drive separator at all. */
+	case SDLK_QUOTE:
 		c = SDLK_COLON;
 		break;
 	case SDLK_RSHIFT:
